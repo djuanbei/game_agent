@@ -47,6 +47,7 @@ class AgentState(TypedDict):
     latest_definition: Dict[str, Any]
     all_definitions: List[Dict[str, Any]]
     user_suggestions: str
+    accumulated_suggestions: str  # <-- NEW: accumulate suggestions within a circle
     next_version_definition: str
     build_retry_allowed: bool
     build_success: bool
@@ -373,24 +374,35 @@ def get_user_input(state: AgentState) -> AgentState:
     print("Rules:")
     for rule in state["latest_definition"].get("rules", []):
         print(f"  - {rule}")
-    print("=" * 60)
-    user = (
-        input(
-            "\nEnter suggestions for next version (or 'skip', 'reload', 'play', 'quit'): "
+
+    # Show accumulated suggestions from current evolution circle
+    if state.get("accumulated_suggestions"):
+        print(
+            f"\nAccumulated suggestions in this circle: {state['accumulated_suggestions']}"
         )
-        .strip()
-        .lower()
-    )
-    if user == "quit":
+
+    print("=" * 60)
+    user = input(
+        "\nEnter suggestions for next version (or 'skip', 'reload', 'play', 'quit'): "
+    ).strip()
+    if user.lower() == "quit":
         sys.exit(0)
-    elif user == "reload":
+    elif user.lower() == "reload":
         state["manual_reload_requested"] = True
         state["play_requested"] = False
-    elif user == "play":
+    elif user.lower() == "play":
         state["play_requested"] = True
         state["manual_reload_requested"] = False
         state["user_suggestions"] = ""
     else:
+        # Accumulate suggestions within the same evolution circle
+        if state.get("accumulated_suggestions"):
+            if user:  # Only add if user provided new suggestion
+                state["accumulated_suggestions"] += f"; {user}"
+        else:
+            state["accumulated_suggestions"] = user
+
+        # Current suggestion is the latest one
         state["user_suggestions"] = user
         state["manual_reload_requested"] = False
         state["play_requested"] = False
@@ -409,6 +421,12 @@ def generate_next_version(state: AgentState) -> AgentState:
         for d in state["all_definitions"]
     )
     config = load_controller_config()
+
+    # Use accumulated suggestions if available, otherwise use current suggestion
+    suggestions_to_use = state.get("accumulated_suggestions", "")
+    if not suggestions_to_use and state.get("user_suggestions"):
+        suggestions_to_use = state["user_suggestions"]
+
     prompt = f"""You are evolving a game definition. Here is the history:
 
 {previous_defs_text}
@@ -416,12 +434,14 @@ def generate_next_version(state: AgentState) -> AgentState:
 Current controller configuration (logical actions to physical buttons):
 {json.dumps(config, indent=2)}
 
-User suggestions: {state["user_suggestions"] if state["user_suggestions"] else "None"}
+User suggestions (accumulated in this evolution circle): {suggestions_to_use if suggestions_to_use else "None"}
 
 Generate the next version (v{state["latest_version"] + 1}) in markdown format with sections:
 # Game Name
 ## Role
 ## Rules (list each rule as a bullet point)
+
+Important: Consider ALL accumulated suggestions from this evolution circle, not just the latest one.
 Only output the markdown, no extra commentary.
 """
     llm = ChatOpenAI(
@@ -476,6 +496,9 @@ def save_approved_version(state: AgentState) -> AgentState:
         else:
             state["all_definitions"].append(parsed)
         print(f"Updated existing version v{current_version} (not yet committed).")
+
+    # Reset accumulated suggestions for next evolution circle
+    state["accumulated_suggestions"] = ""
 
     # Commit all changes to Git
     commit_circle(repo, new_version)
@@ -666,9 +689,15 @@ def user_approval(state: AgentState) -> AgentState:
     ans = input("\nIs this version satisfactory? (yes/no): ").strip().lower()
     if ans == "yes":
         state["game_running"] = False
+        # Reset accumulated suggestions when user approves
+        state["accumulated_suggestions"] = ""
     else:
         state["game_running"] = True
         state["build_retry_allowed"] = True
+        # Keep accumulated suggestions for next iteration in same circle
+        print(
+            f"Suggestions will be accumulated: {state.get('accumulated_suggestions', '')}"
+        )
     return state
 
 
@@ -783,6 +812,7 @@ def main():
         "latest_definition": {},
         "all_definitions": [],
         "user_suggestions": "",
+        "accumulated_suggestions": "",  # <-- NEW
         "next_version_definition": "",
         "build_retry_allowed": True,
         "build_success": False,
