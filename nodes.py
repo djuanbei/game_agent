@@ -32,6 +32,7 @@ from .utils import (
     parse_definition,
     auto_install_missing_module,
     ensure_controller_config,
+    is_file_tracked,
 )
 
 
@@ -143,72 +144,48 @@ def load_versions(state: AgentState) -> AgentState:
 
 
 def initialize_game(state: AgentState) -> AgentState:
-    """Create initial game definition and configuration if none exist."""
+    """Check if required files exist, exit with error if missing."""
     if state["latest_version"] != 0 or state["latest_definition"]:
         # Already have definitions, skip
         return state
 
-    print("\n" + "=" * 60)
-    print("No game definitions found.")
-    print("Let's create the initial game definition.")
-    print("=" * 60)
+    # Check for required files
+    game_files = list(WORK_DIR.glob("game_v*.md"))
+    config_exists = (WORK_DIR / CONFIG_FILE).exists()
 
-    # Ask user for game description
-    description = input(
-        "Describe the game you want to create (e.g., 'a space shooter game'): "
-    ).strip()
-    if not description:
-        description = "a fun arcade game"
+    if not game_files or not config_exists:
+        print("\n" + "=" * 60)
+        print("ERROR: Required files missing.")
+        if not game_files:
+            print("- No game_v*.md files found.")
+        if not config_exists:
+            print(f"- {CONFIG_FILE} not found.")
+        print("\nPlease create:")
+        print("1. game_v0.md - initial game definition in markdown format")
+        print(f"2. {CONFIG_FILE} - controller configuration")
+        print("\nExample game_v0.md:")
+        print("# Game Name")
+        print("## Role")
+        print("## Rules")
+        print("- Rule 1")
+        print("- Rule 2")
+        print(f"\nExample {CONFIG_FILE}:")
+        print(
+            '{"select": "A", "cancel": "B", "shuffle": "Start", "rotate_left": "L1", "rotate_right": "R1"}'
+        )
+        print("=" * 60)
+        sys.exit(1)
 
-    # Ensure controller config exists
+    # Ensure controller config exists (should already exist)
     ensure_controller_config()
 
-    # Generate initial definition using LLM
-    print("\n[Progress] Generating initial game definition using LLM...")
-    config = load_controller_config()
-    prompt = f"""You are creating a brand new game. The user wants: {description}
+    # Load the existing latest version
+    version, latest, all_defs = load_all_definitions()
+    state["latest_version"] = version
+    state["latest_definition"] = latest
+    state["all_definitions"] = all_defs
 
-Create the first version (v0) of the game definition in markdown format with sections:
-# Game Name
-## Role
-## Rules (list each rule as a bullet point)
-
-Controller configuration (logical actions to physical buttons):
-{json.dumps(config, indent=2)}
-
-Only output the markdown, no extra commentary.
-"""
-    llm = ChatOpenAI(
-        model=LLM_MODEL,
-        openai_api_base=LLM_BASE_URL,
-        openai_api_key=LLM_API_KEY,
-        temperature=0.7,
-        streaming=True,
-    )
-    response_content = ""
-    for chunk in llm.stream([HumanMessage(content=prompt)]):
-        if chunk.content:
-            print(chunk.content, end="", flush=True)
-            response_content += chunk.content
-    print("\n\n[Progress] Initial definition generated.")
-
-    # Save as game_v0.md
-    save_definition(0, response_content)
-
-    # Update state with parsed definition
-    parsed = parse_definition(response_content)
-    parsed["version"] = 0
-    state["latest_version"] = 0
-    state["latest_definition"] = parsed
-    state["all_definitions"] = [parsed]
-
-    # Commit initial files to git
-    repo = get_git_repo()
-    repo.git.add("game_v*.md")
-    repo.git.add(CONFIG_FILE)
-    repo.index.commit("Initial game definition and controller configuration")
-    print("Initial files committed to Git.")
-
+    print(f"\nInitialized with game definition v{version}: {latest.get('name', 'N/A')}")
     return state
 
 
@@ -305,14 +282,40 @@ Only output the markdown, no extra commentary.
 
 def save_approved_version(state: AgentState) -> AgentState:
     """Save the approved next version definition to disk, update version, and commit to Git."""
-    new_version = state["latest_version"] + 1
-    save_definition(new_version, state["next_version_definition"])
-    state["latest_version"] = new_version
-    state["latest_definition"] = parse_definition(state["next_version_definition"])
-    state["all_definitions"].append(state["latest_definition"])
-
-    # Commit to Git
+    current_version = state["latest_version"]
     repo = state["git_repo"]
+    current_file = f"game_v{current_version}.md"
+
+    # Check if current version file is already tracked in git
+    tracked = is_file_tracked(repo, current_file)
+
+    if tracked:
+        # File already committed, create new version
+        new_version = current_version + 1
+        save_definition(new_version, state["next_version_definition"])
+        state["latest_version"] = new_version
+        parsed = parse_definition(state["next_version_definition"])
+        parsed["version"] = new_version
+        state["latest_definition"] = parsed
+        state["all_definitions"].append(parsed)
+        print(
+            f"Created new version v{new_version} (previous v{current_version} was committed)."
+        )
+    else:
+        # File not committed yet, update existing version
+        new_version = current_version
+        save_definition(current_version, state["next_version_definition"])
+        parsed = parse_definition(state["next_version_definition"])
+        parsed["version"] = current_version
+        state["latest_definition"] = parsed
+        # Replace the last definition in all_definitions
+        if state["all_definitions"]:
+            state["all_definitions"][-1] = parsed
+        else:
+            state["all_definitions"].append(parsed)
+        print(f"Updated existing version v{current_version} (not yet committed).")
+
+    # Commit all changes to Git
     commit_circle(repo, new_version)
     print(f"Committed circle v{new_version} to Git.")
     return state

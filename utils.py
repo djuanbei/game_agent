@@ -139,6 +139,17 @@ def checkout_last_circle(repo: git.Repo, version: int):
         repo.git.checkout(branch_name)
 
 
+def is_file_tracked(repo: git.Repo, filepath: str) -> bool:
+    """Check if a file is tracked by git (committed)."""
+    try:
+        # Check if file is in git index
+        result = repo.git.ls_files(filepath)
+        return bool(result.strip())
+    except git.exc.GitCommandError:
+        # File not tracked
+        return False
+
+
 def commit_circle(repo: git.Repo, version: int):
     """Commit all relevant files and create branch/tag for finished circle."""
     repo.git.add("game_v*.md")
