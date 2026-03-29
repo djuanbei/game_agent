@@ -244,7 +244,8 @@ def auto_install_missing_module(module_name: str) -> bool:
             return False
 
 
-def auto_fix_code(error_msg: str, code: str = None) -> bool:
+def auto_fix_code(error_msg: str, code: str = None, state: AgentState = None) -> bool:
+    """Fix game code using LLM with context from game definition and user suggestions."""
     if code is None:
         code_path = WORK_DIR / GAME_CODE_FILE
         if not code_path.exists():
@@ -252,10 +253,37 @@ def auto_fix_code(error_msg: str, code: str = None) -> bool:
         code = code_path.read_text(encoding="utf-8")
     print(f"[Auto-fix] Attempting to fix code (error: {error_msg[:200]}...)")
 
+    # Get game definition and user suggestions for context
+    game_def_text = ""
+    user_suggestions_text = ""
+
+    if state:
+        latest = state.get("latest_definition", {})
+        if latest:
+            game_def_text = f"""Game definition:
+Name: {latest.get("name", "N/A")}
+Role: {latest.get("role", "N/A")}
+Rules: {", ".join(latest.get("rules", []))}"""
+
+        suggestions = state.get("accumulated_suggestions", "")
+        if not suggestions:
+            suggestions = state.get("user_suggestions", "")
+        if suggestions:
+            user_suggestions_text = f"User evolution suggestions: {suggestions}"
+
     prompt = (
         "The following Python game code has an error. Please fix the error and return the **entire corrected code**.\n\n"
         "Error message:\n"
         f"{error_msg}\n\n"
+    )
+
+    if game_def_text:
+        prompt += f"{game_def_text}\n\n"
+
+    if user_suggestions_text:
+        prompt += f"{user_suggestions_text}\n\n"
+
+    prompt += (
         "Broken code:\n"
         "```python\n"
         f"{code}\n"
@@ -263,6 +291,7 @@ def auto_fix_code(error_msg: str, code: str = None) -> bool:
         "Requirements:\n"
         "- Keep all functionality and game rules exactly the same.\n"
         "- Only fix the specific error shown above. Ensure the code is syntactically correct and runs without this error.\n"
+        "- Consider the game definition and user suggestions when fixing the code.\n"
         "- Output only the corrected Python code, no extra text.\n"
     )
 
@@ -706,7 +735,7 @@ def build_and_run(state: AgentState) -> AgentState:
     max_fix_attempts = 2
     for attempt in range(max_fix_attempts):
         print(f"[Auto-fix] Attempt {attempt + 1} to fix error using LLM...")
-        if auto_fix_code(error):
+        if auto_fix_code(error, state=state):
             success2, error2 = try_run()
             if success2:
                 state["build_success"] = True
