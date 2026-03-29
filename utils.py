@@ -14,6 +14,7 @@ from .config import (
     CIRCLE_BRANCH_PREFIX, LLM_MODEL, LLM_BASE_URL, LLM_API_KEY
 )
 
+
 # -----------------------------------------------------------------------------
 # Definition loading and parsing
 # -----------------------------------------------------------------------------
@@ -49,6 +50,7 @@ def load_all_definitions() -> Tuple[int, Dict[str, Any], List[Dict[str, Any]]]:
     latest = all_parsed[-1] if all_parsed else {}
     return latest.get('version', 0), latest, all_parsed
 
+
 def parse_definition(content: str) -> Dict[str, Any]:
     """Parse markdown definition into {name, role, rules}."""
     lines = content.splitlines()
@@ -70,10 +72,12 @@ def parse_definition(content: str) -> Dict[str, Any]:
             rules.append(line.strip())
     return {"name": name, "role": role, "rules": rules}
 
+
 def save_definition(version: int, content: str):
     """Write markdown definition to game_v<version>.md."""
     filename = f"game_v{version}.md"
     (WORK_DIR / filename).write_text(content, encoding='utf-8')
+
 
 def load_controller_config() -> Dict[str, str]:
     """Load configure.json."""
@@ -82,9 +86,11 @@ def load_controller_config() -> Dict[str, str]:
         return json.loads(config_path.read_text(encoding='utf-8'))
     return {}
 
+
 def save_controller_config(config: Dict[str, str]):
     """Save controller configuration."""
     (WORK_DIR / CONFIG_FILE).write_text(json.dumps(config, indent=2), encoding='utf-8')
+
 
 # -----------------------------------------------------------------------------
 # Git operations
@@ -98,11 +104,13 @@ def get_git_repo() -> git.Repo:
         repo = git.Repo.init(WORK_DIR)
     return repo
 
+
 def checkout_last_circle(repo: git.Repo, version: int):
     """Checkout branch circle_v<version> if it exists."""
     branch_name = f"{CIRCLE_BRANCH_PREFIX}{version}"
     if branch_name in repo.branches:
         repo.git.checkout(branch_name)
+
 
 def commit_circle(repo: git.Repo, version: int):
     """Commit all relevant files and create branch/tag for finished circle."""
@@ -119,6 +127,7 @@ def commit_circle(repo: git.Repo, version: int):
     else:
         repo.git.branch("-D", branch_name)
         repo.create_head(branch_name)
+
 
 # -----------------------------------------------------------------------------
 # Installation and code fixing helpers
@@ -147,6 +156,7 @@ echo "All dependencies installed. Run 'python3 game.py' to start the game."
         return True
     return False
 
+
 def auto_install_pygame() -> bool:
     """Try to install pygame automatically using install.sh or pip."""
     print("[Auto-fix] Attempting to install pygame automatically...")
@@ -166,6 +176,23 @@ def auto_install_pygame() -> bool:
     except Exception as e:
         print(f"[Auto-fix] pip install failed: {e}")
         return False
+
+
+def auto_install_missing_module(module_name: str) -> bool:
+    """Install any missing Python module using pip."""
+    print(f"[Auto-fix] Installing missing module '{module_name}'...")
+    try:
+        subprocess.run(["pip3", "install", module_name], check=True, capture_output=True)
+        print(f"[Auto-fix] Successfully installed {module_name}.")
+        return True
+    except:
+        try:
+            subprocess.run(["pip3", "install", "--user", module_name], check=True, capture_output=True)
+            print(f"[Auto-fix] Successfully installed {module_name} (user install).")
+            return True
+        except Exception as e:
+            print(f"[Auto-fix] Failed to install {module_name}: {e}")
+            return False
 
 
 def auto_fix_code(error_msg: str, code: str = None) -> bool:

@@ -1,9 +1,7 @@
-"""Agent state definition."""
 from typing import Dict, List, Any, Optional, TypedDict
 import git
 
 class AgentState(TypedDict):
-    """State of the agent across nodes."""
     latest_version: int
     latest_definition: Dict[str, Any]
     all_definitions: List[Dict[str, Any]]
@@ -13,4 +11,5 @@ class AgentState(TypedDict):
     build_success: bool
     game_running: bool
     manual_reload_requested: bool
+    play_requested: bool   # <-- added
     git_repo: Optional[git.Repo]

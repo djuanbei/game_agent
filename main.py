@@ -23,6 +23,7 @@ def main():
         'build_success': False,
         'game_running': True,
         'manual_reload_requested': False,
+        'play_requested': False,
         'git_repo': None,
     }
     app = build_graph()

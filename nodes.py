@@ -1,6 +1,8 @@
 """LangGraph node functions for game evolution."""
 import sys
 import subprocess
+import json
+import re
 from typing import Any
 
 from langchain_core.messages import HumanMessage
@@ -14,8 +16,109 @@ from .state import AgentState
 from .utils import (
     load_all_definitions, load_controller_config, save_definition,
     get_git_repo, checkout_last_circle, commit_circle,
-    ensure_install_script, auto_install_pygame, auto_fix_code, parse_definition
+    ensure_install_script, auto_install_pygame, auto_fix_code, parse_definition,
+    auto_install_missing_module  # <-- ADD THIS
 )
+
+
+# ... (keep all other node functions unchanged: load_versions, git_checkout_last_circle,
+#      get_user_input, generate_next_version, save_next_version, generate_game_code,
+#      update_documentation, play_game, user_approval)
+
+# Replace ONLY build_and_run with the enhanced version below
+
+def build_and_run(state: AgentState) -> AgentState:
+    """Attempt to run the game. Auto-install missing modules, then auto-fix any error using LLM."""
+    if not (WORK_DIR / GAME_CODE_FILE).exists():
+        state['build_success'] = False
+        return state
+
+    def try_run():
+        try:
+            result = subprocess.run(
+                ["python3", GAME_CODE_FILE],
+                cwd=WORK_DIR,
+                timeout=5,
+                capture_output=True,
+                text=True,
+            )
+            if result.returncode != 0:
+                raise Exception(result.stderr)
+            return True, ""
+        except subprocess.TimeoutExpired:
+            return True, ""
+        except Exception as e:
+            return False, str(e)
+
+    # First attempt
+    success, error = try_run()
+    if success:
+        state['build_success'] = True
+        print("Build successful.")
+        return state
+
+    print(f"Build error: {error}")
+
+    # ----- AUTO-INSTALL MISSING MODULES (special case) -----
+    # This is the only case where we don't use LLM first, because it's a dependency issue.
+    if "ModuleNotFoundError: No module named" in error and state['build_retry_allowed']:
+        import re
+        match = re.search(r"ModuleNotFoundError: No module named '(\w+)'", error)
+        if match:
+            missing_module = match.group(1)
+            print(f"[Auto-fix] Missing module '{missing_module}'. Installing...")
+            if missing_module == "pygame":
+                installed = auto_install_pygame()
+            else:
+                installed = auto_install_missing_module(missing_module)
+            if installed:
+                print("[Auto-fix] Retrying build after installation...")
+                success2, error2 = try_run()
+                if success2:
+                    state['build_success'] = True
+                    print("Build successful after module installation.")
+                    state['build_retry_allowed'] = False
+                    return state
+                else:
+                    error = error2
+                    print(f"Build still failing: {error[:200]}")
+            else:
+                print("[Auto-fix] Could not install missing module.")
+
+    # ----- GENERIC AUTO-FIX USING LLM (for any error) -----
+    # Try up to 2 times
+    max_fix_attempts = 2
+    for attempt in range(max_fix_attempts):
+        if not state['build_retry_allowed'] or state['build_success']:
+            break
+        print(f"[Auto-fix] Attempt {attempt + 1} to fix error using LLM...")
+        if auto_fix_code(error):
+            success2, error2 = try_run()
+            if success2:
+                state['build_success'] = True
+                print("Build successful after auto-fix.")
+                state['build_retry_allowed'] = False
+                return state
+            else:
+                error = error2
+                print(f"Auto-fix applied but error persists: {error[:200]}")
+        else:
+            print("[Auto-fix] LLM could not fix the error.")
+            break
+
+    # ----- FALLBACK: ask user once -----
+    if state['build_retry_allowed'] and not state['build_success']:
+        fix = input("Enter fix suggestion (or 'skip'): ").strip()
+        if fix.lower() != 'skip':
+            print("Please apply the fix manually and press Enter when done.")
+            input()
+            success2, _ = try_run()
+            state['build_success'] = success2
+        state['build_retry_allowed'] = False
+    elif not state['build_success']:
+        print("Build failed and no retry allowed. Exiting cycle.")
+    return state
+
 
 # -----------------------------------------------------------------------------
 # Node implementations
@@ -30,6 +133,7 @@ def load_versions(state: AgentState) -> AgentState:
     state['manual_reload_requested'] = False
     return state
 
+
 def git_checkout_last_circle(state: AgentState) -> AgentState:
     """Checkout the branch of the last completed circle."""
     repo = get_git_repo()
@@ -38,33 +142,43 @@ def git_checkout_last_circle(state: AgentState) -> AgentState:
         checkout_last_circle(repo, state['latest_version'])
     return state
 
+
 def get_user_input(state: AgentState) -> AgentState:
-    """Prompt user for suggestions or reload command."""
-    print("\n" + "="*60)
+    """Prompt user for suggestions or reload/play/quit commands."""
+    print("\n" + "=" * 60)
     print(f"Current game definition (v{state['latest_version']}):")
     print(f"Name: {state['latest_definition'].get('name', 'N/A')}")
     print(f"Role: {state['latest_definition'].get('role', 'N/A')}")
     print("Rules:")
     for rule in state['latest_definition'].get('rules', []):
         print(f"  - {rule}")
-    print("="*60)
-    user = input("\nEnter suggestions for next version (or 'skip', 'reload', 'quit'): ").strip()
-    if user.lower() == 'quit':
+    print("=" * 60)
+    user = input("\nEnter suggestions for next version (or 'skip', 'reload', 'play', 'quit'): ").strip().lower()
+    if user == 'quit':
         sys.exit(0)
-    elif user.lower() == 'reload':
+    elif user == 'reload':
         state['manual_reload_requested'] = True
+        state['play_requested'] = False
+    elif user == 'play':
+        state['play_requested'] = True
+        state['manual_reload_requested'] = False
+        state['user_suggestions'] = ""   # clear any previous suggestions
     else:
         state['user_suggestions'] = user
         state['manual_reload_requested'] = False
+        state['play_requested'] = False
     return state
 
+
+
+
 def generate_next_version(state: AgentState) -> AgentState:
-    """Use LLM to generate the next version definition."""
+    """Generate the next version definition in memory (do NOT save to disk)."""
     if state['manual_reload_requested']:
         return state
 
     print("\n[Progress] Generating next version definition using LLM...")
-    # Build prompt
+    # Build prompt (same as before)
     previous_defs_text = "\n\n".join(
         f"# Version {d['version']}\n"
         f"Name: {d.get('name')}\n"
@@ -82,7 +196,7 @@ Current controller configuration (logical actions to physical buttons):
 
 User suggestions: {state['user_suggestions'] if state['user_suggestions'] else 'None'}
 
-Generate the next version (v{state['latest_version']+1}) in markdown format with sections:
+Generate the next version (v{state['latest_version'] + 1}) in markdown format with sections:
 # Game Name
 ## Role
 ## Rules (list each rule as a bullet point)
@@ -103,19 +217,24 @@ Only output the markdown, no extra commentary.
             response_content += chunk.content
     print("\n\n[Progress] Generation complete.")
     state['next_version_definition'] = response_content
+    # Note: we do NOT increment latest_version or save to disk here.
     return state
 
-def save_next_version(state: AgentState) -> AgentState:
-    """Write the new definition to disk."""
-    if state['manual_reload_requested']:
-        return state
+
+def save_approved_version(state: AgentState) -> AgentState:
+    """Save the approved next version definition to disk, update version, and commit to Git."""
     new_version = state['latest_version'] + 1
     save_definition(new_version, state['next_version_definition'])
-    # Update latest info
     state['latest_version'] = new_version
     state['latest_definition'] = parse_definition(state['next_version_definition'])
     state['all_definitions'].append(state['latest_definition'])
+
+    # Commit to Git
+    repo = state['git_repo']
+    commit_circle(repo, new_version)
+    print(f"Committed circle v{new_version} to Git.")
     return state
+
 
 def generate_game_code(state: AgentState) -> AgentState:
     """Generate/update game.py based on latest definition and controller config."""
@@ -164,6 +283,7 @@ Output only the Python code, no extra text.
     (WORK_DIR / GAME_CODE_FILE).write_text(code.strip(), encoding='utf-8')
     return state
 
+
 def update_documentation(state: AgentState) -> AgentState:
     """Generate README.md and install.sh."""
     latest = state['latest_definition']
@@ -200,96 +320,6 @@ This game is open source under the MIT License.
     return state
 
 
-### Updated `nodes.py` – `build_and_run` (handles any error)
-
-Replace the existing `build_and_run` with this version:
-
-```python
-def build_and_run(state: AgentState) -> AgentState:
-    """Attempt to run the game. Auto-fix any error (missing modules, syntax, runtime)."""
-    if not (WORK_DIR / GAME_CODE_FILE).exists():
-        state['build_success'] = False
-        return state
-
-    def try_run():
-        try:
-            # Use subprocess to run the game, but we also need to catch import errors.
-            # We'll run with a short timeout to catch immediate crashes.
-            result = subprocess.run(
-                ["python3", GAME_CODE_FILE],
-                cwd=WORK_DIR,
-                timeout=5,
-                capture_output=True,
-                text=True,
-            )
-            if result.returncode != 0:
-                raise Exception(result.stderr)
-            return True, ""
-        except subprocess.TimeoutExpired:
-            # Timeout means it started without immediate error – consider success
-            return True, ""
-        except Exception as e:
-            return False, str(e)
-
-    # First attempt
-    success, error = try_run()
-    if success:
-        state['build_success'] = True
-        print("Build successful.")
-        return state
-
-    print(f"Build error: {error}")
-
-    # Auto-fix for missing pygame (special case, but could be handled generically)
-    if "No module named 'pygame'" in error and state['build_retry_allowed']:
-        print("[Auto-fix] Missing pygame detected. Attempting automatic installation...")
-        if auto_install_pygame():
-            print("[Auto-fix] Installation completed. Retrying build...")
-            success2, error2 = try_run()
-            if success2:
-                state['build_success'] = True
-                print("Build successful after pygame installation.")
-                state['build_retry_allowed'] = False
-                return state
-            else:
-                error = error2
-        else:
-            print("[Auto-fix] Automatic pygame installation failed.")
-
-    # Generic auto-fix for any error (syntax, runtime, NameError, etc.)
-    if state['build_retry_allowed']:
-        for attempt in range(2):  # max 2 fix attempts
-            print(f"[Auto-fix] Attempt {attempt+1} to fix error with LLM...")
-            if auto_fix_code(error):
-                success2, error2 = try_run()
-                if success2:
-                    state['build_success'] = True
-                    print("Build successful after auto-fix.")
-                    state['build_retry_allowed'] = False
-                    return state
-                else:
-                    error = error2
-                    print(f"Auto-fix applied but error persists: {error[:200]}")
-            else:
-                print("[Auto-fix] Could not automatically fix error.")
-                break
-        # If we get here, auto-fix failed
-        if not state['build_success']:
-            print("[Auto-fix] Error could not be resolved automatically.")
-
-    # If auto-fix not applicable or failed, ask user once
-    if state['build_retry_allowed']:
-        fix = input("Enter fix suggestion (or 'skip'): ").strip()
-        if fix.lower() != 'skip':
-            print("Please apply the fix manually and press Enter when done.")
-            input()
-            success2, _ = try_run()
-            state['build_success'] = success2
-        state['build_retry_allowed'] = False
-    else:
-        print("Build failed and no retry allowed. Exiting cycle.")
-    return state
-
 def play_game(state: AgentState) -> AgentState:
     """Launch the game and wait for it to exit (Esc three times)."""
     if not state['build_success']:
@@ -302,17 +332,15 @@ def play_game(state: AgentState) -> AgentState:
     print("Game ended.")
     return state
 
+
 def user_approval(state: AgentState) -> AgentState:
-    """Ask user if satisfied; if yes, commit to Git and finish; else continue."""
+    """Ask user if satisfied; set game_running flag accordingly."""
     if not state['build_success']:
         return state
     ans = input("\nIs this version satisfactory? (yes/no): ").strip().lower()
     if ans == 'yes':
-        repo = state['git_repo']
-        commit_circle(repo, state['latest_version'])
-        print(f"Committed circle v{state['latest_version']} to Git.")
-        state['game_running'] = False
-        return state
+        state['game_running'] = False  # signals approval
     else:
+        state['game_running'] = True  # not approved, continue
         state['build_retry_allowed'] = True
-        return state
+    return state
