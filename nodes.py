@@ -199,14 +199,22 @@ This game is open source under the MIT License.
     ensure_install_script()
     return state
 
+
+### Updated `nodes.py` – `build_and_run` (handles any error)
+
+Replace the existing `build_and_run` with this version:
+
+```python
 def build_and_run(state: AgentState) -> AgentState:
-    """Attempt to run the game. Auto-fix missing pygame AND syntax errors."""
+    """Attempt to run the game. Auto-fix any error (missing modules, syntax, runtime)."""
     if not (WORK_DIR / GAME_CODE_FILE).exists():
         state['build_success'] = False
         return state
 
     def try_run():
         try:
+            # Use subprocess to run the game, but we also need to catch import errors.
+            # We'll run with a short timeout to catch immediate crashes.
             result = subprocess.run(
                 ["python3", GAME_CODE_FILE],
                 cwd=WORK_DIR,
@@ -218,6 +226,7 @@ def build_and_run(state: AgentState) -> AgentState:
                 raise Exception(result.stderr)
             return True, ""
         except subprocess.TimeoutExpired:
+            # Timeout means it started without immediate error – consider success
             return True, ""
         except Exception as e:
             return False, str(e)
@@ -231,7 +240,7 @@ def build_and_run(state: AgentState) -> AgentState:
 
     print(f"Build error: {error}")
 
-    # Auto-fix for missing pygame
+    # Auto-fix for missing pygame (special case, but could be handled generically)
     if "No module named 'pygame'" in error and state['build_retry_allowed']:
         print("[Auto-fix] Missing pygame detected. Attempting automatic installation...")
         if auto_install_pygame():
@@ -247,25 +256,26 @@ def build_and_run(state: AgentState) -> AgentState:
         else:
             print("[Auto-fix] Automatic pygame installation failed.")
 
-    # Auto-fix for syntax errors
-    if "SyntaxError" in error and state['build_retry_allowed']:
+    # Generic auto-fix for any error (syntax, runtime, NameError, etc.)
+    if state['build_retry_allowed']:
         for attempt in range(2):  # max 2 fix attempts
-            print(f"[Auto-fix] Syntax error detected. Attempt {attempt+1} to fix...")
+            print(f"[Auto-fix] Attempt {attempt+1} to fix error with LLM...")
             if auto_fix_code(error):
                 success2, error2 = try_run()
                 if success2:
                     state['build_success'] = True
-                    print("Build successful after syntax fix.")
+                    print("Build successful after auto-fix.")
                     state['build_retry_allowed'] = False
                     return state
                 else:
                     error = error2
+                    print(f"Auto-fix applied but error persists: {error[:200]}")
             else:
-                print("[Auto-fix] Could not automatically fix syntax error.")
+                print("[Auto-fix] Could not automatically fix error.")
                 break
         # If we get here, auto-fix failed
         if not state['build_success']:
-            print("[Auto-fix] Syntax error could not be resolved automatically.")
+            print("[Auto-fix] Error could not be resolved automatically.")
 
     # If auto-fix not applicable or failed, ask user once
     if state['build_retry_allowed']:

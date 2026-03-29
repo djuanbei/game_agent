@@ -167,22 +167,25 @@ def auto_install_pygame() -> bool:
         print(f"[Auto-fix] pip install failed: {e}")
         return False
 
-def auto_fix_code(error_msg: str) -> bool:
+
+def auto_fix_code(error_msg: str, code: str = None) -> bool:
     """
     Attempt to fix the game code by sending the error back to the LLM.
-    Returns True if a fix was applied and the code now passes a quick syntax check.
+    Returns True if a fix was applied and the code now passes a quick check.
     """
-    print(f"[Auto-fix] Attempting to fix code (error: {error_msg[:200]}...)")
-    code_path = WORK_DIR / GAME_CODE_FILE
-    if not code_path.exists():
-        return False
-    broken_code = code_path.read_text(encoding='utf-8')
+    if code is None:
+        code_path = WORK_DIR / GAME_CODE_FILE
+        if not code_path.exists():
+            return False
+        code = code_path.read_text(encoding='utf-8')
 
-    prompt = f"""The following Python game code has a syntax error. Please fix the error and return the **entire corrected code**.
+    print(f"[Auto-fix] Attempting to fix code (error: {error_msg[:200]}...)")
+
+    prompt = f"""The following Python game code has an error. Please fix the error and return the **entire corrected code**.
 
 Error message:
 {error_msg}
 
 Broken code:
 ```python
-{broken_code}
+{code}
