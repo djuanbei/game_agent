@@ -1,14 +1,17 @@
-"""Helper functions for file I/O, Git operations, and installation."""
+"""Utility functions for file I/O, Git operations, installation, and code fixing."""
 import os
 import json
 import subprocess
 from pathlib import Path
 from typing import Dict, List, Any, Tuple
+
 import git
+from langchain_core.messages import HumanMessage
+from langchain_openai import ChatOpenAI
 
 from .config import (
     WORK_DIR, GAME_CODE_FILE, CONFIG_FILE, README_FILE, INSTALL_FILE,
-    CIRCLE_BRANCH_PREFIX
+    CIRCLE_BRANCH_PREFIX, LLM_MODEL, LLM_BASE_URL, LLM_API_KEY
 )
 
 # -----------------------------------------------------------------------------
@@ -16,12 +19,17 @@ from .config import (
 # -----------------------------------------------------------------------------
 
 def load_all_definitions() -> Tuple[int, Dict[str, Any], List[Dict[str, Any]]]:
-    """Scan WORK_DIR for game_v*.md files, parse them, return (latest_version, latest_def, all_defs)."""
+    """
+    Scan WORK_DIR for game_v*.md files, parse them, and return:
+    - highest version number
+    - parsed dict of the latest version
+    - list of all parsed definitions (ordered by version)
+    """
     pattern = "game_v*.md"
     files = list(WORK_DIR.glob(pattern))
     if not files:
         return 0, {}, []
-    
+
     versions = []
     for f in files:
         try:
@@ -30,14 +38,14 @@ def load_all_definitions() -> Tuple[int, Dict[str, Any], List[Dict[str, Any]]]:
         except:
             continue
     versions.sort(key=lambda x: x[0])
-    
+
     all_parsed = []
     for num, f in versions:
         content = f.read_text(encoding='utf-8')
         parsed = parse_definition(content)
         parsed['version'] = num
         all_parsed.append(parsed)
-    
+
     latest = all_parsed[-1] if all_parsed else {}
     return latest.get('version', 0), latest, all_parsed
 
@@ -113,7 +121,7 @@ def commit_circle(repo: git.Repo, version: int):
         repo.create_head(branch_name)
 
 # -----------------------------------------------------------------------------
-# Installation helpers
+# Installation and code fixing helpers
 # -----------------------------------------------------------------------------
 
 def ensure_install_script():
@@ -158,3 +166,23 @@ def auto_install_pygame() -> bool:
     except Exception as e:
         print(f"[Auto-fix] pip install failed: {e}")
         return False
+
+def auto_fix_code(error_msg: str) -> bool:
+    """
+    Attempt to fix the game code by sending the error back to the LLM.
+    Returns True if a fix was applied and the code now passes a quick syntax check.
+    """
+    print(f"[Auto-fix] Attempting to fix code (error: {error_msg[:200]}...)")
+    code_path = WORK_DIR / GAME_CODE_FILE
+    if not code_path.exists():
+        return False
+    broken_code = code_path.read_text(encoding='utf-8')
+
+    prompt = f"""The following Python game code has a syntax error. Please fix the error and return the **entire corrected code**.
+
+Error message:
+{error_msg}
+
+Broken code:
+```python
+{broken_code}

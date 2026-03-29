@@ -1,4 +1,4 @@
-"""LangGraph node functions."""
+"""LangGraph node functions for game evolution."""
 import sys
 import subprocess
 from typing import Any
@@ -14,7 +14,7 @@ from .state import AgentState
 from .utils import (
     load_all_definitions, load_controller_config, save_definition,
     get_git_repo, checkout_last_circle, commit_circle,
-    ensure_install_script, auto_install_pygame, parse_definition
+    ensure_install_script, auto_install_pygame, auto_fix_code, parse_definition
 )
 
 # -----------------------------------------------------------------------------
@@ -22,6 +22,7 @@ from .utils import (
 # -----------------------------------------------------------------------------
 
 def load_versions(state: AgentState) -> AgentState:
+    """Load existing definition files."""
     version, latest, all_defs = load_all_definitions()
     state['latest_version'] = version
     state['latest_definition'] = latest
@@ -30,6 +31,7 @@ def load_versions(state: AgentState) -> AgentState:
     return state
 
 def git_checkout_last_circle(state: AgentState) -> AgentState:
+    """Checkout the branch of the last completed circle."""
     repo = get_git_repo()
     state['git_repo'] = repo
     if state['latest_version'] > 0:
@@ -37,6 +39,7 @@ def git_checkout_last_circle(state: AgentState) -> AgentState:
     return state
 
 def get_user_input(state: AgentState) -> AgentState:
+    """Prompt user for suggestions or reload command."""
     print("\n" + "="*60)
     print(f"Current game definition (v{state['latest_version']}):")
     print(f"Name: {state['latest_definition'].get('name', 'N/A')}")
@@ -56,6 +59,7 @@ def get_user_input(state: AgentState) -> AgentState:
     return state
 
 def generate_next_version(state: AgentState) -> AgentState:
+    """Use LLM to generate the next version definition."""
     if state['manual_reload_requested']:
         return state
 
@@ -74,7 +78,7 @@ def generate_next_version(state: AgentState) -> AgentState:
 {previous_defs_text}
 
 Current controller configuration (logical actions to physical buttons):
-{config}
+{json.dumps(config, indent=2)}
 
 User suggestions: {state['user_suggestions'] if state['user_suggestions'] else 'None'}
 
@@ -102,16 +106,19 @@ Only output the markdown, no extra commentary.
     return state
 
 def save_next_version(state: AgentState) -> AgentState:
+    """Write the new definition to disk."""
     if state['manual_reload_requested']:
         return state
     new_version = state['latest_version'] + 1
     save_definition(new_version, state['next_version_definition'])
+    # Update latest info
     state['latest_version'] = new_version
     state['latest_definition'] = parse_definition(state['next_version_definition'])
     state['all_definitions'].append(state['latest_definition'])
     return state
 
 def generate_game_code(state: AgentState) -> AgentState:
+    """Generate/update game.py based on latest definition and controller config."""
     print("\n[Progress] Generating game code using LLM...")
     latest = state['latest_definition']
     config = load_controller_config()
@@ -123,7 +130,7 @@ Role: {latest.get('role')}
 Rules: {', '.join(latest.get('rules', []))}
 
 Controller configuration (logical action -> physical button):
-{config}
+{json.dumps(config, indent=2)}
 
 Requirements:
 - The game must read the controller configuration from configure.json at runtime.
@@ -149,7 +156,7 @@ Output only the Python code, no extra text.
             print(chunk.content, end="", flush=True)
             code += chunk.content
     print("\n\n[Progress] Game code generation complete.")
-    # Clean code fences
+    # Remove any markdown code fences if present
     if code.startswith("```python"):
         code = code[9:]
     if code.endswith("```"):
@@ -158,8 +165,10 @@ Output only the Python code, no extra text.
     return state
 
 def update_documentation(state: AgentState) -> AgentState:
+    """Generate README.md and install.sh."""
     latest = state['latest_definition']
     config = load_controller_config()
+    # README
     readme_content = f"""# {latest.get('name')}
 
 ## Description
@@ -170,7 +179,7 @@ def update_documentation(state: AgentState) -> AgentState:
 
 ### Controls
 The game uses logical actions mapped to your 8BitDo Pro 3 controller buttons:
-{config}
+{json.dumps(config, indent=2)}
 
 Press **Escape three times** to exit the game.
 
@@ -191,73 +200,100 @@ This game is open source under the MIT License.
     return state
 
 def build_and_run(state: AgentState) -> AgentState:
-    try:
-        result = subprocess.run(
-            ["python3", GAME_CODE_FILE],
-            cwd=WORK_DIR,
-            timeout=5,
-            capture_output=True,
-            text=True,
-        )
-        if result.returncode != 0:
-            raise Exception(result.stderr)
+    """Attempt to run the game. Auto-fix missing pygame AND syntax errors."""
+    if not (WORK_DIR / GAME_CODE_FILE).exists():
+        state['build_success'] = False
+        return state
+
+    def try_run():
+        try:
+            result = subprocess.run(
+                ["python3", GAME_CODE_FILE],
+                cwd=WORK_DIR,
+                timeout=5,
+                capture_output=True,
+                text=True,
+            )
+            if result.returncode != 0:
+                raise Exception(result.stderr)
+            return True, ""
+        except subprocess.TimeoutExpired:
+            return True, ""
+        except Exception as e:
+            return False, str(e)
+
+    # First attempt
+    success, error = try_run()
+    if success:
         state['build_success'] = True
         print("Build successful.")
         return state
-    except Exception as e:
-        error_msg = str(e)
-        print(f"Build error: {error_msg}")
-        
-        if "No module named 'pygame'" in error_msg and state['build_retry_allowed']:
-            print("[Auto-fix] Missing pygame. Attempting automatic installation...")
-            if auto_install_pygame():
-                print("[Auto-fix] Installation completed. Retrying build...")
-                try:
-                    result = subprocess.run(
-                        ["python3", GAME_CODE_FILE],
-                        cwd=WORK_DIR,
-                        timeout=5,
-                        capture_output=True,
-                        text=True,
-                    )
-                    if result.returncode != 0:
-                        raise Exception(result.stderr)
+
+    print(f"Build error: {error}")
+
+    # Auto-fix for missing pygame
+    if "No module named 'pygame'" in error and state['build_retry_allowed']:
+        print("[Auto-fix] Missing pygame detected. Attempting automatic installation...")
+        if auto_install_pygame():
+            print("[Auto-fix] Installation completed. Retrying build...")
+            success2, error2 = try_run()
+            if success2:
+                state['build_success'] = True
+                print("Build successful after pygame installation.")
+                state['build_retry_allowed'] = False
+                return state
+            else:
+                error = error2
+        else:
+            print("[Auto-fix] Automatic pygame installation failed.")
+
+    # Auto-fix for syntax errors
+    if "SyntaxError" in error and state['build_retry_allowed']:
+        for attempt in range(2):  # max 2 fix attempts
+            print(f"[Auto-fix] Syntax error detected. Attempt {attempt+1} to fix...")
+            if auto_fix_code(error):
+                success2, error2 = try_run()
+                if success2:
                     state['build_success'] = True
-                    print("Build successful after auto-fix.")
+                    print("Build successful after syntax fix.")
                     state['build_retry_allowed'] = False
                     return state
-                except Exception as e2:
-                    print(f"[Auto-fix] Build still failing: {e2}")
+                else:
+                    error = error2
             else:
-                print("[Auto-fix] Automatic installation failed.")
-        
-        if state['build_retry_allowed']:
-            fix = input("Enter fix suggestion (or 'skip'): ").strip()
-            if fix.lower() != 'skip':
-                print("Please apply the fix manually and press Enter when done.")
-                input()
-                try:
-                    subprocess.run(["python3", GAME_CODE_FILE], cwd=WORK_DIR, timeout=5, check=True)
-                    state['build_success'] = True
-                except:
-                    state['build_success'] = False
-            state['build_retry_allowed'] = False
-        else:
-            print("Build failed and no retry allowed. Exiting cycle.")
-        return state
+                print("[Auto-fix] Could not automatically fix syntax error.")
+                break
+        # If we get here, auto-fix failed
+        if not state['build_success']:
+            print("[Auto-fix] Syntax error could not be resolved automatically.")
+
+    # If auto-fix not applicable or failed, ask user once
+    if state['build_retry_allowed']:
+        fix = input("Enter fix suggestion (or 'skip'): ").strip()
+        if fix.lower() != 'skip':
+            print("Please apply the fix manually and press Enter when done.")
+            input()
+            success2, _ = try_run()
+            state['build_success'] = success2
+        state['build_retry_allowed'] = False
+    else:
+        print("Build failed and no retry allowed. Exiting cycle.")
+    return state
 
 def play_game(state: AgentState) -> AgentState:
+    """Launch the game and wait for it to exit (Esc three times)."""
     if not state['build_success']:
         return state
     print("Starting game...")
     try:
         subprocess.run(["python3", GAME_CODE_FILE], cwd=WORK_DIR, check=True)
     except subprocess.CalledProcessError:
-        pass
+        pass  # Game might exit with error, but we'll continue
     print("Game ended.")
     return state
 
 def user_approval(state: AgentState) -> AgentState:
+    """Ask user if satisfied; if yes, commit to Git and finish; else continue."""
     if not state['build_success']:
         return state
     ans = input("\nIs this version satisfactory? (yes/no): ").strip().lower()
