@@ -313,10 +313,71 @@ def load_versions(state: AgentState) -> AgentState:
 
 
 def initialize_game(state: AgentState) -> AgentState:
-    """Check if required files exist, exit with error if missing."""
+    """Check if required files exist, create from game name if missing."""
     if state["latest_version"] != 0 or state["latest_definition"]:
         # Already have definitions, skip
         return state
+
+    # Check for required files
+    game_files = list(WORK_DIR.glob("game_v*.md"))
+    config_exists = (WORK_DIR / CONFIG_FILE).exists()
+
+    if not game_files or not config_exists:
+        print("\n" + "=" * 60)
+        print("No game definition found. Let's create one from a game name.")
+        print("=" * 60)
+
+        # Ask for game name
+        game_name = input(
+            "Enter a name for your game (e.g., 'Space Shooter', 'Puzzle Adventure'): "
+        ).strip()
+        if not game_name:
+            game_name = "My Game"
+
+        # Create default game_v0.md
+        default_game_content = f"""# {game_name}
+
+## Role
+A fun game created with the evolution agent.
+
+## Rules
+- Use the controller to play
+- Follow the on-screen instructions
+- Have fun!
+"""
+        save_definition(0, default_game_content)
+        print(f"Created game_v0.md with game name: {game_name}")
+
+        # Create default configure.json
+        ensure_controller_config()
+        print(f"Created {CONFIG_FILE} with default controller configuration")
+
+        print("\nInitial files created. You can now run the evolution agent.")
+        print("The agent will help you evolve and improve your game.")
+        print("=" * 60)
+
+        # Load the created definition
+        version, latest, all_defs = load_all_definitions()
+        state["latest_version"] = version
+        state["latest_definition"] = latest
+        state["all_definitions"] = all_defs
+
+        print(
+            f"\nInitialized with game definition v{version}: {latest.get('name', 'N/A')}"
+        )
+        return state
+
+    # Ensure controller config exists (should already exist)
+    ensure_controller_config()
+
+    # Load the existing latest version
+    version, latest, all_defs = load_all_definitions()
+    state["latest_version"] = version
+    state["latest_definition"] = latest
+    state["all_definitions"] = all_defs
+
+    print(f"\nInitialized with game definition v{version}: {latest.get('name', 'N/A')}")
+    return state
 
     # Check for required files
     game_files = list(WORK_DIR.glob("game_v*.md"))
