@@ -26,27 +26,28 @@ from .utils import (
 #      update_documentation, play_game, user_approval)
 
 # Replace ONLY build_and_run with the enhanced version below
-
 def build_and_run(state: AgentState) -> AgentState:
     """Attempt to run the game. Auto-install missing modules, then auto-fix any error using LLM."""
     if not (WORK_DIR / GAME_CODE_FILE).exists():
         state['build_success'] = False
         return state
 
-    def try_run():
+    def try_run(timeout_sec=5):
         try:
             result = subprocess.run(
                 ["python3", GAME_CODE_FILE],
                 cwd=WORK_DIR,
-                timeout=5,
+                timeout=timeout_sec,
                 capture_output=True,
                 text=True,
             )
             if result.returncode != 0:
                 raise Exception(result.stderr)
-            return True, ""
+            return True, None
         except subprocess.TimeoutExpired:
-            return True, ""
+            # Game started and is still running (waiting for user input) – treat as success
+            print("Game started successfully (no immediate errors).")
+            return True, None
         except Exception as e:
             return False, str(e)
 
@@ -54,15 +55,12 @@ def build_and_run(state: AgentState) -> AgentState:
     success, error = try_run()
     if success:
         state['build_success'] = True
-        print("Build successful.")
         return state
 
     print(f"Build error: {error}")
 
-    # ----- AUTO-INSTALL MISSING MODULES (special case) -----
-    # This is the only case where we don't use LLM first, because it's a dependency issue.
-    if "ModuleNotFoundError: No module named" in error and state['build_retry_allowed']:
-        import re
+    # ----- AUTO-INSTALL MISSING MODULES -----
+    if "ModuleNotFoundError: No module named" in error:
         match = re.search(r"ModuleNotFoundError: No module named '(\w+)'", error)
         if match:
             missing_module = match.group(1)
@@ -77,7 +75,6 @@ def build_and_run(state: AgentState) -> AgentState:
                 if success2:
                     state['build_success'] = True
                     print("Build successful after module installation.")
-                    state['build_retry_allowed'] = False
                     return state
                 else:
                     error = error2
@@ -86,18 +83,14 @@ def build_and_run(state: AgentState) -> AgentState:
                 print("[Auto-fix] Could not install missing module.")
 
     # ----- GENERIC AUTO-FIX USING LLM (for any error) -----
-    # Try up to 2 times
     max_fix_attempts = 2
     for attempt in range(max_fix_attempts):
-        if not state['build_retry_allowed'] or state['build_success']:
-            break
         print(f"[Auto-fix] Attempt {attempt + 1} to fix error using LLM...")
         if auto_fix_code(error):
             success2, error2 = try_run()
             if success2:
                 state['build_success'] = True
                 print("Build successful after auto-fix.")
-                state['build_retry_allowed'] = False
                 return state
             else:
                 error = error2
@@ -107,16 +100,15 @@ def build_and_run(state: AgentState) -> AgentState:
             break
 
     # ----- FALLBACK: ask user once -----
-    if state['build_retry_allowed'] and not state['build_success']:
-        fix = input("Enter fix suggestion (or 'skip'): ").strip()
-        if fix.lower() != 'skip':
-            print("Please apply the fix manually and press Enter when done.")
-            input()
-            success2, _ = try_run()
-            state['build_success'] = success2
-        state['build_retry_allowed'] = False
-    elif not state['build_success']:
-        print("Build failed and no retry allowed. Exiting cycle.")
+    print("Automatic fixes exhausted. Please help fix the error.")
+    fix = input("Enter fix suggestion (or 'skip'): ").strip()
+    if fix.lower() != 'skip':
+        print("Please apply the fix manually and press Enter when done.")
+        input()
+        success2, _ = try_run()
+        state['build_success'] = success2
+    else:
+        state['build_success'] = False
     return state
 
 
@@ -162,14 +154,12 @@ def get_user_input(state: AgentState) -> AgentState:
     elif user == 'play':
         state['play_requested'] = True
         state['manual_reload_requested'] = False
-        state['user_suggestions'] = ""   # clear any previous suggestions
+        state['user_suggestions'] = ""  # clear any previous suggestions
     else:
         state['user_suggestions'] = user
         state['manual_reload_requested'] = False
         state['play_requested'] = False
     return state
-
-
 
 
 def generate_next_version(state: AgentState) -> AgentState:

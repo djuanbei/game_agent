@@ -1,103 +1,82 @@
 #!/usr/bin/env python3
 """
 LangGraph Agent for Evolving Game Definitions (8BitDo Pro 3) with Git Integration
-
-This agent manages the iterative evolution of a game defined in markdown files.
-It integrates with Git to version both the game definitions and the implementation.
+Enhanced version: auto-install missing modules, LLM auto-fix, play command, delayed saving.
 """
 
 import os
 import sys
 import json
 import subprocess
-import time
-import signal
+import re
 from pathlib import Path
-from typing import Dict, List, Any, Optional, TypedDict, Annotated
+from typing import Dict, List, Any, Optional, TypedDict
 
 import git
 from langgraph.graph import StateGraph, END
-from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.messages import HumanMessage
 from langchain_openai import ChatOpenAI
 
 # -----------------------------------------------------------------------------
 # Configuration
 # -----------------------------------------------------------------------------
 
-WORK_DIR = Path.cwd()  # The directory where the game lives
-GAME_CODE_FILE = "game.py"  # Generated game implementation
-CONFIG_FILE = "configure.json"  # Controller mapping
+WORK_DIR = Path.cwd()
+GAME_CODE_FILE = "game.py"
+CONFIG_FILE = "configure.json"
 README_FILE = "README.md"
 INSTALL_FILE = "install.sh"
 
-# LLM settings (DeepSeek via OpenAI-compatible endpoint)
-LLM_MODEL = "deepseek-chat"  # or "deepseek-coder"
+LLM_MODEL = "deepseek-chat"
 LLM_BASE_URL = "https://api.deepseek.com/v1"
 LLM_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "your-api-key-here")
 
-# Git branch/tag prefix for circles
 CIRCLE_BRANCH_PREFIX = "circle_v"
 
-
 # -----------------------------------------------------------------------------
-# State definition for LangGraph
+# State definition
 # -----------------------------------------------------------------------------
 
 class AgentState(TypedDict):
-    """State of the agent across nodes."""
     latest_version: int
-    latest_definition: Dict[str, Any]  # parsed from game_vn.md
-    all_definitions: List[Dict[str, Any]]  # list of parsed definitions
+    latest_definition: Dict[str, Any]
+    all_definitions: List[Dict[str, Any]]
     user_suggestions: str
-    next_version_definition: str  # raw markdown of new version
+    next_version_definition: str
     build_retry_allowed: bool
     build_success: bool
     game_running: bool
     manual_reload_requested: bool
+    play_requested: bool
     git_repo: Optional[git.Repo]
 
-
 # -----------------------------------------------------------------------------
-# Helper functions
+# Helper functions (file I/O, Git, installation, code fixing)
 # -----------------------------------------------------------------------------
 
-def load_all_definitions() -> tuple[int, Dict[str, Any], List[Dict[str, Any]]]:
-    """
-    Scan WORK_DIR for game_v*.md files, parse them, and return:
-    - highest version number
-    - parsed dict of the latest version
-    - list of all parsed definitions (ordered by version)
-    """
+def load_all_definitions():
     pattern = "game_v*.md"
     files = list(WORK_DIR.glob(pattern))
     if not files:
-        # No definitions exist – create initial v0
         return 0, {}, []
-
     versions = []
     for f in files:
-        # Extract number from filename
         try:
             num = int(f.stem.split('_v')[1])
             versions.append((num, f))
         except:
             continue
     versions.sort(key=lambda x: x[0])
-
     all_parsed = []
     for num, f in versions:
         content = f.read_text(encoding='utf-8')
         parsed = parse_definition(content)
         parsed['version'] = num
         all_parsed.append(parsed)
-
     latest = all_parsed[-1] if all_parsed else {}
     return latest.get('version', 0), latest, all_parsed
 
-
 def parse_definition(content: str) -> Dict[str, Any]:
-    """Parse a markdown definition into a dict with name, role, rules."""
-    # Simple parsing: look for headings
     lines = content.splitlines()
     name = ""
     role = ""
@@ -117,74 +96,154 @@ def parse_definition(content: str) -> Dict[str, Any]:
             rules.append(line.strip())
     return {"name": name, "role": role, "rules": rules}
 
-
-def load_controller_config() -> Dict[str, str]:
-    """Load configure.json, which maps logical actions to physical buttons."""
-    config_path = WORK_DIR / CONFIG_FILE
-    if config_path.exists():
-        return json.loads(config_path.read_text(encoding='utf-8'))
-    else:
-        # Default config (empty)
-        return {}
-
-
-def save_controller_config(config: Dict[str, str]):
-    """Save controller configuration."""
-    (WORK_DIR / CONFIG_FILE).write_text(json.dumps(config, indent=2), encoding='utf-8')
-
-
 def save_definition(version: int, content: str):
-    """Write markdown definition to game_v<version>.md."""
     filename = f"game_v{version}.md"
     (WORK_DIR / filename).write_text(content, encoding='utf-8')
 
+def load_controller_config() -> Dict[str, str]:
+    config_path = WORK_DIR / CONFIG_FILE
+    if config_path.exists():
+        return json.loads(config_path.read_text(encoding='utf-8'))
+    return {}
 
 def get_git_repo() -> git.Repo:
-    """Get or initialize Git repository in WORK_DIR."""
     try:
         repo = git.Repo(WORK_DIR)
     except git.exc.InvalidGitRepositoryError:
         repo = git.Repo.init(WORK_DIR)
     return repo
 
-
 def checkout_last_circle(repo: git.Repo, version: int):
-    """Checkout the branch circle_v<version> if it exists."""
     branch_name = f"{CIRCLE_BRANCH_PREFIX}{version}"
     if branch_name in repo.branches:
         repo.git.checkout(branch_name)
-    else:
-        # If no branch, stay as is (first run)
-        pass
-
 
 def commit_circle(repo: git.Repo, version: int):
-    """Commit all relevant files and create a branch/tag for the finished circle."""
-    # Add all relevant files (ignore anything not under version control)
     repo.git.add("game_v*.md")
     repo.git.add(GAME_CODE_FILE)
     repo.git.add(CONFIG_FILE)
     repo.git.add(README_FILE)
     repo.git.add(INSTALL_FILE)
-    # Commit
     commit_msg = f"Evolution circle v{version} completed"
     repo.index.commit(commit_msg)
-    # Create branch
     branch_name = f"{CIRCLE_BRANCH_PREFIX}{version}"
     if branch_name not in repo.branches:
         repo.create_head(branch_name)
     else:
-        # If branch already exists, force update (should not happen)
         repo.git.branch("-D", branch_name)
         repo.create_head(branch_name)
 
+def ensure_install_script():
+    install_path = WORK_DIR / INSTALL_FILE
+    if not install_path.exists():
+        content = """#!/bin/bash
+# Install dependencies for the game on macOS Intel
+set -e
+if ! command -v brew &> /dev/null; then
+    echo "Homebrew not found. Please install Homebrew first: https://brew.sh/"
+    exit 1
+fi
+brew install sdl2 sdl2_image sdl2_mixer sdl2_ttf
+pip3 install --user pygame
+echo "All dependencies installed. Run 'python3 game.py' to start the game."
+"""
+        install_path.write_text(content, encoding='utf-8')
+        os.chmod(install_path, 0o755)
+        return True
+    return False
+
+def auto_install_pygame() -> bool:
+    print("[Auto-fix] Attempting to install pygame automatically...")
+    install_path = WORK_DIR / INSTALL_FILE
+    if install_path.exists():
+        try:
+            subprocess.run([str(install_path)], cwd=WORK_DIR, check=True)
+            print("[Auto-fix] install.sh completed.")
+            return True
+        except Exception as e:
+            print(f"[Auto-fix] install.sh failed: {e}")
+    try:
+        subprocess.run(["pip3", "install", "--user", "pygame"], check=True)
+        print("[Auto-fix] pygame installed via pip.")
+        return True
+    except Exception as e:
+        print(f"[Auto-fix] pip install failed: {e}")
+        return False
+
+def auto_install_missing_module(module_name: str) -> bool:
+    print(f"[Auto-fix] Installing missing module '{module_name}'...")
+    try:
+        subprocess.run(["pip3", "install", module_name], check=True, capture_output=True)
+        print(f"[Auto-fix] Successfully installed {module_name}.")
+        return True
+    except:
+        try:
+            subprocess.run(["pip3", "install", "--user", module_name], check=True, capture_output=True)
+            print(f"[Auto-fix] Successfully installed {module_name} (user install).")
+            return True
+        except Exception as e:
+            print(f"[Auto-fix] Failed to install {module_name}: {e}")
+            return False
+
+def auto_fix_code(error_msg: str, code: str = None) -> bool:
+    if code is None:
+        code_path = WORK_DIR / GAME_CODE_FILE
+        if not code_path.exists():
+            return False
+        code = code_path.read_text(encoding='utf-8')
+    print(f"[Auto-fix] Attempting to fix code (error: {error_msg[:200]}...)")
+
+    # Build prompt using simple string concatenation (no triple quotes)
+    prompt = (
+        "The following Python game code has an error. Please fix the error and return the **entire corrected code**.\n\n"
+        "Error message:\n"
+        f"{error_msg}\n\n"
+        "Broken code:\n"
+        "```python\n"
+        f"{code}\n"
+        "```\n\n"
+        "Requirements:\n"
+        "- Keep all functionality and game rules exactly the same.\n"
+        "- Only fix the specific error shown above. Ensure the code is syntactically correct and runs without this error.\n"
+        "- Output only the corrected Python code, no extra text.\n"
+    )
+
+    llm = ChatOpenAI(
+        model=LLM_MODEL,
+        openai_api_base=LLM_BASE_URL,
+        openai_api_key=LLM_API_KEY,
+        temperature=0.3,
+        streaming=True,
+    )
+    print("[Auto-fix] Requesting corrected code from LLM...")
+    fixed_code = ""
+    for chunk in llm.stream([HumanMessage(content=prompt)]):
+        if chunk.content:
+            print(chunk.content, end="", flush=True)
+            fixed_code += chunk.content
+    print("\n[Auto-fix] Received response.")
+
+    if fixed_code.startswith("```python"):
+        fixed_code = fixed_code[9:]
+    if fixed_code.endswith("```"):
+        fixed_code = fixed_code[:-3]
+    fixed_code = fixed_code.strip()
+
+    (WORK_DIR / GAME_CODE_FILE).write_text(fixed_code, encoding='utf-8')
+
+    try:
+        compile(fixed_code, '<string>', 'exec')
+        print("[Auto-fix] Compilation check passed.")
+        return True
+    except Exception as e:
+        print(f"[Auto-fix] Error still present: {e}")
+        return False
 
 # -----------------------------------------------------------------------------
 # LangGraph nodes
 # -----------------------------------------------------------------------------
 
 def load_versions(state: AgentState) -> AgentState:
-    """Load existing definition files."""
     version, latest, all_defs = load_all_definitions()
     state['latest_version'] = version
     state['latest_definition'] = latest
@@ -192,21 +251,14 @@ def load_versions(state: AgentState) -> AgentState:
     state['manual_reload_requested'] = False
     return state
 
-
 def git_checkout_last_circle(state: AgentState) -> AgentState:
-    """Checkout the branch of the last completed circle."""
     repo = get_git_repo()
     state['git_repo'] = repo
-    # Determine last finished version: from branch tags? For simplicity, use latest_version.
-    # In practice you might have a file that records last circle.
-    # We'll assume that the latest definition corresponds to the last circle.
     if state['latest_version'] > 0:
         checkout_last_circle(repo, state['latest_version'])
     return state
 
-
 def get_user_input(state: AgentState) -> AgentState:
-    """Prompt user for suggestions or reload command."""
     print("\n" + "=" * 60)
     print(f"Current game definition (v{state['latest_version']}):")
     print(f"Name: {state['latest_definition'].get('name', 'N/A')}")
@@ -215,24 +267,26 @@ def get_user_input(state: AgentState) -> AgentState:
     for rule in state['latest_definition'].get('rules', []):
         print(f"  - {rule}")
     print("=" * 60)
-    user = input("\nEnter suggestions for next version (or 'skip', 'reload', 'quit'): ").strip()
-    if user.lower() == 'quit':
+    user = input("\nEnter suggestions for next version (or 'skip', 'reload', 'play', 'quit'): ").strip().lower()
+    if user == 'quit':
         sys.exit(0)
-    elif user.lower() == 'reload':
+    elif user == 'reload':
         state['manual_reload_requested'] = True
+        state['play_requested'] = False
+    elif user == 'play':
+        state['play_requested'] = True
+        state['manual_reload_requested'] = False
+        state['user_suggestions'] = ""
     else:
         state['user_suggestions'] = user
         state['manual_reload_requested'] = False
+        state['play_requested'] = False
     return state
 
-
 def generate_next_version(state: AgentState) -> AgentState:
-    """Use LLM to generate the next version definition."""
     if state['manual_reload_requested']:
         return state
-
     print("\n[Progress] Generating next version definition using LLM...")
-    # Build prompt
     previous_defs_text = "\n\n".join(
         f"# Version {d['version']}\n"
         f"Name: {d.get('name')}\n"
@@ -273,22 +327,18 @@ Only output the markdown, no extra commentary.
     state['next_version_definition'] = response_content
     return state
 
-
-def save_next_version(state: AgentState) -> AgentState:
-    """Write the new definition to disk."""
-    if state['manual_reload_requested']:
-        return state
+def save_approved_version(state: AgentState) -> AgentState:
     new_version = state['latest_version'] + 1
     save_definition(new_version, state['next_version_definition'])
-    # Update latest info
     state['latest_version'] = new_version
     state['latest_definition'] = parse_definition(state['next_version_definition'])
     state['all_definitions'].append(state['latest_definition'])
+    repo = state['git_repo']
+    commit_circle(repo, new_version)
+    print(f"Committed circle v{new_version} to Git.")
     return state
 
-
 def generate_game_code(state: AgentState) -> AgentState:
-    """Generate/update game.py based on latest definition and controller config."""
     print("\n[Progress] Generating game code using LLM...")
     latest = state['latest_definition']
     config = load_controller_config()
@@ -326,7 +376,6 @@ Output only the Python code, no extra text.
             print(chunk.content, end="", flush=True)
             code += chunk.content
     print("\n\n[Progress] Game code generation complete.")
-    # Remove any markdown code fences if present
     if code.startswith("```python"):
         code = code[9:]
     if code.endswith("```"):
@@ -334,12 +383,9 @@ Output only the Python code, no extra text.
     (WORK_DIR / GAME_CODE_FILE).write_text(code.strip(), encoding='utf-8')
     return state
 
-
 def update_documentation(state: AgentState) -> AgentState:
-    """Generate README.md and install.sh."""
     latest = state['latest_definition']
     config = load_controller_config()
-    # README
     readme_content = f"""# {latest.get('name')}
 
 ## Description
@@ -367,154 +413,160 @@ Run `./install.sh` to install dependencies, then run `python3 game.py`.
 This game is open source under the MIT License.
 """
     (WORK_DIR / README_FILE).write_text(readme_content, encoding='utf-8')
-
-    # install.sh
-    install_content = """#!/bin/bash
-# Install dependencies for the game on macOS Intel
-set -e
-
-# Check for Homebrew
-if ! command -v brew &> /dev/null; then
-    echo "Homebrew not found. Please install Homebrew first: https://brew.sh/"
-    exit 1
-fi
-
-# Install Pygame dependencies via Homebrew
-brew install sdl2 sdl2_image sdl2_mixer sdl2_ttf
-
-# Install Python dependencies
-pip3 install --user pygame
-
-echo "All dependencies installed. Run 'python3 game.py' to start the game."
-"""
-    (WORK_DIR / INSTALL_FILE).write_text(install_content, encoding='utf-8')
-    os.chmod(WORK_DIR / INSTALL_FILE, 0o755)
+    ensure_install_script()
     return state
-
 
 def build_and_run(state: AgentState) -> AgentState:
-    """Attempt to run the game. If error, ask user once for fix and retry."""
-    # We'll simply run game.py in a subprocess and check if it starts without error.
-    # For simplicity, we'll run with a timeout to catch immediate errors.
-    try:
-        # Run with a short timeout to see if it starts properly
-        result = subprocess.run(
-            ["python3", GAME_CODE_FILE],
-            cwd=WORK_DIR,
-            timeout=5,
-            capture_output=True,
-            text=True,
-        )
-        if result.returncode != 0:
-            raise Exception(result.stderr)
-        state['build_success'] = True
-        print("Build successful.")
-    except Exception as e:
-        print(f"Build error: {e}")
+    if not (WORK_DIR / GAME_CODE_FILE).exists():
         state['build_success'] = False
-        if state['build_retry_allowed']:
-            # Ask user once
-            fix = input("Enter fix suggestion (or 'skip'): ").strip()
-            if fix.lower() != 'skip':
-                # For simplicity, we assume the fix is applied manually by the user.
-                # In a more advanced version, the agent would try to incorporate the fix.
-                print("Please apply the fix manually and press Enter when done.")
-                input()
-                # Retry build
-                try:
-                    subprocess.run(["python3", GAME_CODE_FILE], cwd=WORK_DIR, timeout=5, check=True)
+        return state
+
+    def try_run(timeout_sec=5):
+        try:
+            result = subprocess.run(
+                ["python3", GAME_CODE_FILE],
+                cwd=WORK_DIR,
+                timeout=timeout_sec,
+                capture_output=True,
+                text=True,
+            )
+            if result.returncode != 0:
+                raise Exception(result.stderr)
+            return True, None
+        except subprocess.TimeoutExpired:
+            print("Game started successfully (no immediate errors).")
+            return True, None
+        except Exception as e:
+            return False, str(e)
+
+    success, error = try_run()
+    if success:
+        state['build_success'] = True
+        return state
+
+    print(f"Build error: {error}")
+
+    # Auto-install missing modules
+    if "ModuleNotFoundError: No module named" in error:
+        match = re.search(r"ModuleNotFoundError: No module named '(\w+)'", error)
+        if match:
+            missing_module = match.group(1)
+            print(f"[Auto-fix] Missing module '{missing_module}'. Installing...")
+            if missing_module == "pygame":
+                installed = auto_install_pygame()
+            else:
+                installed = auto_install_missing_module(missing_module)
+            if installed:
+                print("[Auto-fix] Retrying build after installation...")
+                success2, error2 = try_run()
+                if success2:
                     state['build_success'] = True
-                except:
-                    state['build_success'] = False
-            state['build_retry_allowed'] = False
+                    print("Build successful after module installation.")
+                    return state
+                else:
+                    error = error2
+                    print(f"Build still failing: {error[:200]}")
+            else:
+                print("[Auto-fix] Could not install missing module.")
         else:
-            print("Build failed and no retry allowed. Exiting cycle.")
+            print("[Auto-fix] Could not extract module name.")
+
+    # Generic LLM auto-fix (up to 2 attempts)
+    max_fix_attempts = 2
+    for attempt in range(max_fix_attempts):
+        print(f"[Auto-fix] Attempt {attempt+1} to fix error using LLM...")
+        if auto_fix_code(error):
+            success2, error2 = try_run()
+            if success2:
+                state['build_success'] = True
+                print("Build successful after auto-fix.")
+                return state
+            else:
+                error = error2
+                print(f"Auto-fix applied but error persists: {error[:200]}")
+        else:
+            print("[Auto-fix] LLM could not fix the error.")
+            break
+
+    # Fallback to user
+    print("Automatic fixes exhausted. Please help fix the error.")
+    fix = input("Enter fix suggestion (or 'skip'): ").strip()
+    if fix.lower() != 'skip':
+        print("Please apply the fix manually and press Enter when done.")
+        input()
+        success2, _ = try_run()
+        state['build_success'] = success2
+    else:
+        state['build_success'] = False
     return state
 
-
 def play_game(state: AgentState) -> AgentState:
-    """Launch the game and wait for it to exit (Esc three times)."""
     if not state['build_success']:
         return state
     print("Starting game...")
-    # Run game in a subprocess and wait for it to finish.
-    # The game should exit on its own after Esc three times.
     try:
         subprocess.run(["python3", GAME_CODE_FILE], cwd=WORK_DIR, check=True)
     except subprocess.CalledProcessError:
-        pass  # Game might exit with error, but we'll continue
+        pass
     print("Game ended.")
     return state
 
-
 def user_approval(state: AgentState) -> AgentState:
-    """Ask user if satisfied; if yes, commit to Git and finish; else continue."""
     if not state['build_success']:
-        # If build failed, don't ask for approval; just continue?
         return state
     ans = input("\nIs this version satisfactory? (yes/no): ").strip().lower()
     if ans == 'yes':
-        # Commit and tag
-        repo = state['git_repo']
-        commit_circle(repo, state['latest_version'])
-        print(f"Committed circle v{state['latest_version']} to Git.")
         state['game_running'] = False
-        # End the graph
-        return state
     else:
-        # Continue loop: reset suggestions, increment build_retry_allowed flag for next build
+        state['game_running'] = True
         state['build_retry_allowed'] = True
-        return state
-
+    return state
 
 # -----------------------------------------------------------------------------
 # Graph construction
 # -----------------------------------------------------------------------------
 
 def should_continue_after_user_input(state: AgentState) -> str:
-    """Decide next node after get_user_input."""
-    if state['manual_reload_requested']:
+    if state.get('play_requested', False):
+        return "play_game"
+    elif state.get('manual_reload_requested', False):
         return "load_versions"
     else:
         return "generate_next_version"
 
-
 def should_continue_after_build(state: AgentState) -> str:
-    """If build failed and retry not allowed, go to END; else continue."""
     if not state['build_success'] and not state['build_retry_allowed']:
         return END
     else:
         return "play_game"
 
+def after_play(state: AgentState) -> str:
+    if state.get('play_requested', False):
+        state['play_requested'] = False
+        return "get_user_input"
+    else:
+        return "user_approval"
 
-def should_continue_after_approval(state: AgentState) -> str:
-    """If approved, end; else go to get_user_input to continue."""
+def after_approval(state: AgentState) -> str:
     if state['game_running'] is False:
-        return END
+        return "save_approved_version"
     else:
         return "get_user_input"
 
-
 def build_graph() -> StateGraph:
-    """Create and compile the LangGraph."""
     graph = StateGraph(AgentState)
-
-    # Add nodes
     graph.add_node("load_versions", load_versions)
     graph.add_node("git_checkout_last_circle", git_checkout_last_circle)
     graph.add_node("get_user_input", get_user_input)
     graph.add_node("generate_next_version", generate_next_version)
-    graph.add_node("save_next_version", save_next_version)
     graph.add_node("generate_game_code", generate_game_code)
     graph.add_node("update_documentation", update_documentation)
     graph.add_node("build_and_run", build_and_run)
     graph.add_node("play_game", play_game)
     graph.add_node("user_approval", user_approval)
+    graph.add_node("save_approved_version", save_approved_version)
 
-    # Set entry point
     graph.set_entry_point("load_versions")
-
-    # Define edges
     graph.add_edge("load_versions", "git_checkout_last_circle")
     graph.add_edge("git_checkout_last_circle", "get_user_input")
 
@@ -522,13 +574,13 @@ def build_graph() -> StateGraph:
         "get_user_input",
         should_continue_after_user_input,
         {
+            "play_game": "play_game",
             "load_versions": "load_versions",
             "generate_next_version": "generate_next_version",
         }
     )
 
-    graph.add_edge("generate_next_version", "save_next_version")
-    graph.add_edge("save_next_version", "generate_game_code")
+    graph.add_edge("generate_next_version", "generate_game_code")
     graph.add_edge("generate_game_code", "update_documentation")
     graph.add_edge("update_documentation", "build_and_run")
 
@@ -541,27 +593,32 @@ def build_graph() -> StateGraph:
         }
     )
 
-    graph.add_edge("play_game", "user_approval")
-
     graph.add_conditional_edges(
-        "user_approval",
-        should_continue_after_approval,
+        "play_game",
+        after_play,
         {
-            END: END,
+            "user_approval": "user_approval",
             "get_user_input": "get_user_input",
         }
     )
 
+    graph.add_conditional_edges(
+        "user_approval",
+        after_approval,
+        {
+            "save_approved_version": "save_approved_version",
+            "get_user_input": "get_user_input",
+        }
+    )
+
+    graph.add_edge("save_approved_version", END)
     return graph.compile()
 
-
 # -----------------------------------------------------------------------------
-# Main loop
+# Main
 # -----------------------------------------------------------------------------
 
 def main():
-    """Run the agent."""
-    # Initial state
     initial_state: AgentState = {
         'latest_version': 0,
         'latest_definition': {},
@@ -572,13 +629,12 @@ def main():
         'build_success': False,
         'game_running': True,
         'manual_reload_requested': False,
+        'play_requested': False,
         'git_repo': None,
     }
     app = build_graph()
-    # Run the graph
-    final_state = app.invoke(initial_state)
+    app.invoke(initial_state)
     print("Agent finished.")
-
 
 if __name__ == "__main__":
     main()
